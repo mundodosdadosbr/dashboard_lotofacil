@@ -1,0 +1,146 @@
+import pytest
+import paramiko
+import boto3
+import io
+from unittest import mock
+from botocore.exceptions import ClientError
+from my_module import lambda_handler, get_secret  # supondo que o script esteja em um arquivo chamado my_module.py
+
+# Mock da resposta do Secrets Manager
+def mock_get_secret(secret_name):
+    if secret_name == "valid_secret":
+        return "fake_secret"
+    raise ClientError({}, "GetSecretValue")
+
+# Mock da resposta do boto3 S3 client
+class MockS3Client:
+    def upload_fileobj(self, data, bucket, key):
+        pass
+
+# Mock da resposta do Paramiko SFTP client
+class MockSFTPClient:
+    def __init__(self, *args, **kwargs):
+        self.files = ["file1.txt", "file2.txt"]
+
+    def chdir(self, path):
+        pass
+
+    def listdir(self):
+        return self.files
+
+    def getfo(self, filename, fl):
+        fl.write(b"fake file content")
+
+# Mock da resposta do Paramiko SSH client
+class MockSSHClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def set_missing_host_key_policy(self, policy):
+        pass
+
+    def connect(self, hostname, port, username, password):
+        pass
+
+    def get_transport(self):
+        return MockTransport()
+
+    def close(self):
+        pass
+
+class MockTransport:
+    def __init__(self):
+        pass
+
+    def open_session(self):
+        return mock.MagicMock()
+
+@pytest.fixture
+def mock_env(monkeypatch):
+    monkeypatch.setattr(boto3, "client", lambda service: MockS3Client() if service == "s3" else None)
+    monkeypatch.setattr(paramiko, "SSHClient", MockSSHClient)
+    monkeypatch.setattr(paramiko.SFTPClient, "from_transport", lambda transport: MockSFTPClient())
+    monkeypatch.setattr("my_module.get_secret", mock_get_secret)
+
+def test_lambda_handler_success(mock_env):
+    event = {
+        "ast_server": "fake_server",
+        "ast_user": "fake_user",
+        "ast_port": 22,
+        "secret_manager": "valid_secret",
+        "remote_path": "/remote/path",
+        "target_bucket": "my_bucket",
+        "target_path": "s3/path/"
+    }
+    context = {}
+
+    response = lambda_handler(event, context)
+
+    assert response["statusCode"] == 200
+    assert "EnviadosComSucesso" in response
+    assert response["EnviadosComSucesso"] == ["file1.txt", "file2.txt"]
+
+def test_lambda_handler_connection_failure(mock_env):
+    event = {
+        "ast_server": "fake_server",
+        "ast_user": "fake_user",
+        "ast_port": 22,
+        "secret_manager": "invalid_secret",
+        "remote_path": "/remote/path",
+        "target_bucket": "my_bucket",
+        "target_path": "s3/path/"
+    }
+    context = {}
+
+    with pytest.raises(ValueError, match="Erro na Conexão"):
+        lambda_handler(event, context)
+
+def test_lambda_handler_sftp_failure(mock_env, monkeypatch):
+    class MockSFTPClientWithFailure(MockSFTPClient):
+        def listdir(self):
+            raise IOError("SFTP listdir error")
+
+    monkeypatch.setattr(paramiko.SFTPClient, "from_transport", lambda transport: MockSFTPClientWithFailure())
+
+    event = {
+        "ast_server": "fake_server",
+        "ast_user": "fake_user",
+        "ast_port": 22,
+        "secret_manager": "valid_secret",
+        "remote_path": "/remote/path",
+        "target_bucket": "my_bucket",
+        "target_path": "s3/path/"
+    }
+    context = {}
+
+    with pytest.raises(IOError, match="SFTP listdir error"):
+        lambda_handler(event, context)
+
+def test_lambda_handler_s3_upload_failure(mock_env, monkeypatch):
+    class MockS3ClientWithFailure(MockS3Client):
+        def upload_fileobj(self, data, bucket, key):
+            raise ClientError({}, "UploadError")
+
+    monkeypatch.setattr(boto3, "client", lambda service: MockS3ClientWithFailure() if service == "s3" else None)
+
+    event = {
+        "ast_server": "fake_server",
+        "ast_user": "fake_user",
+        "ast_port": 22,
+        "secret_manager": "valid_secret",
+        "remote_path": "/remote/path",
+        "target_bucket": "my_bucket",
+        "target_path": "s3/path/"
+    }
+    context = {}
+
+    with pytest.raises(ClientError, match="UploadError"):
+        lambda_handler(event, context)
+
+def test_get_secret_success():
+    secret = get_secret("valid_secret")
+    assert secret == "fake_secret"
+
+def test_get_secret_failure():
+    with pytest.raises(ClientError):
+        get_secret("invalid_secret")

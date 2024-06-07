@@ -1,0 +1,148 @@
+import paramiko
+import logging
+import sys
+import boto3
+import io
+from botocore.exceptions import ClientError
+from boto3.s3.transfer import TransferConfig
+
+GB = 1024 ** 3
+config = TransferConfig(multipart_threshold=1*GB)
+
+logger = logging.getLogger("AST to S3")
+logger.setLevel(logging.DEBUG)
+
+paramiko_logger = logging.getLogger("paramiko")
+paramiko_logger.setLevel(logging.DEBUG)
+paramiko_logger.addHandler(logging.StreamHandler())
+
+
+class StreamToLogger(object):
+
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+
+    def write(self, message):
+        if message.rstrip() != "":
+            self.logger.log(self.level, message.rstrip())
+
+    def flush(self):
+        for handler in self.logger.handlers:
+            handler.flush()
+
+
+stdout_logger = logging.getLogger("STDOUT")
+stderr_logger = logging.getLogger("STDERR")
+
+sys.stdout = StreamToLogger(stdout_logger, logging.DEBUG)
+sys.stderr = StreamToLogger(stderr_logger, logging.DEBUG)
+
+
+def get_secret(secret_name):
+
+    region_name = "sa-east-1"
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+    except ClientError as e:
+        logging.exception("Error AWS secret")
+        raise e
+
+    secret = get_secret_value_response['SecretString']
+    return secret
+
+
+
+def lambda_handler(event, context):
+    logger.info('Receber as variáveis do Airflow')
+    logger.info(event)
+    ast_server = event['ast_server']
+    ast_user = event['ast_user']
+    ast_port = event['ast_port']
+    secret_manager = event['secret_manager']
+    remote_path = event['remote_path']
+    remote_filename = event['remote_filename']
+    target_bucket = event['target_bucket']
+    target_path = event['target_path']
+
+    logger.info(f'remote_server: {ast_server}')
+    logger.info(f'secret_manager: {secret_manager}')
+    logger.info(f'ast_port: {ast_port}')
+    logger.info(f'user_ast: {ast_user}')
+    logger.info(f'remote_path: {remote_path}')
+    logger.info(f'remote_filename: {remote_filename}')
+    logger.info(f'target_bucket: {target_bucket}')
+    logger.info(f'target_path: {target_path}')
+
+    try:
+        logger.info('Iniciando SSHCLient')
+        client = paramiko.SSHClient()
+        logger.info('SSHCLient Iniciado')
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        logger.info('Iniciando client S3')
+        s3_client = boto3.client('s3')
+        logger.info('client S3 iniciado')
+
+        logger.info(f'Tentando conexão com AST na porta {ast_port}')
+
+        n = 0
+        while n < 10:
+            try:
+                client.connect(ast_server, ast_port, ast_user, get_secret(secret_manager))
+                n = 10
+            except Exception as e:
+                logger.info(f'Erro conexão AST {n} vez(s) {e}')
+                n += 1
+                if (n == 10):
+                    logger.info('Erro conexão AST')
+                    raise ValueError("Erro na Conexão")
+
+        logger.info(f'Conectado com sucesso em {ast_server}:{ast_port}')
+
+        logger.info('Tentando abrir AST')
+        logger.info('client AST modificado para usar o max packet size do servidor de destino: 32000  ')
+        transport = client.get_transport()
+
+        with paramiko.SFTPClient.from_transport(transport, max_packet_size=32000) as sftp:
+
+            logger.info('Downloading file {0} from sftp to S3'.format(remote_filename))
+
+            with io.BytesIO() as data:
+
+                sftp.chdir(remote_path)
+
+                sftp.getfo(remote_filename, data)
+                data.seek(0)
+
+                s3_client.upload_fileobj(
+                    data,
+                    f'{target_bucket}',
+                    target_path + remote_filename,
+                    Config=config
+                )
+                logger.info(f'Salva no s3 {remote_filename}')
+
+        logger.info('fechando conexão SFTP')
+        sftp.close()
+        logger.info('Desligando client SSH')
+        client.close()
+
+        logger.info("Função executada com sucesso.")
+        return {
+            'statusCode': 200,
+            'EnviadosComSucesso': remote_filename
+        }
+
+    except Exception as e:
+        erro = str(e)
+        logger.error(f'Erro na execucao: {erro}')
+        raise

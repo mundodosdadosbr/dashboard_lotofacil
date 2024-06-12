@@ -1,202 +1,11 @@
-import paramiko
-import logging
-import sys
-import boto3
-import io
-import re
-from datetime import datetime
-from botocore.exceptions import ClientError
-from boto3.s3.transfer import TransferConfig
-
-GB = 1024 ** 3
-config = TransferConfig(multipart_threshold=1*GB)
-
-logger = logging.getLogger("AST Path score_360 to S3")
-logger.setLevel(logging.DEBUG)
-
-paramiko_logger = logging.getLogger("paramiko")
-paramiko_logger.setLevel(logging.DEBUG)
-paramiko_logger.addHandler(logging.StreamHandler())
-
-
-class StreamToLogger(object):
-
-    def __init__(self, logger, level):
-        self.logger = logger
-        self.level = level
-
-    def write(self, message):
-        if message.rstrip() != "":
-            self.logger.log(self.level, message.rstrip())
-
-    def flush(self):
-        for handler in self.logger.handlers:
-            handler.flush()
-
-
-stdout_logger = logging.getLogger("STDOUT")
-stderr_logger = logging.getLogger("STDERR")
-
-sys.stdout = StreamToLogger(stdout_logger, logging.DEBUG)
-sys.stderr = StreamToLogger(stderr_logger, logging.DEBUG)
-
-def remover_caracteres(text):
-    return re.sub(r'[^a-zA-Z0-9]', '', text)
-
-def get_secret(secret_name):
-
-    region_name = "sa-east-1"
-    session = boto3.session.Session()
-    client = session.client(
-        service_name='secretsmanager',
-        region_name=region_name
-    )
-
-    try:
-        get_secret_value_response = client.get_secret_value(
-            SecretId=secret_name
-        )
-    except ClientError as e:
-        logging.exception("Error AWS secret")
-        raise e
-
-    secret = get_secret_value_response['SecretString']
-    return secret
-
-def encrypt_data(kms_client, key_id, data):
-    response =  kms_client.ecrypt(
-        KeyId = key_id,
-        Plaintext = data
-    )
-    return response['CiphertextBlob']
-
-def validate_file(header, bank_type):
-    if bank_type == "Bradesco":
-        if len(header) >= 31 and header[16] == '0' and header[17:31].isdigit():
-            return True, '0' + header[17:31]
-    elif bank_type == "Banco do Brasil":
-        if len(header) >= 28 and header[14:28].isdigit():
-            return True, header[14:22]
-    return False, None
-
-def lambda_handler(event, context):
-    logger.info('Receber as variáveis do Airflow')
-    logger.info(event)
-    ast_server = event['ast_server']
-    ast_user = event['ast_user']
-    ast_port = event['ast_port']
-    secret_manager = event['secret_manager']
-    remote_path = event['remote_path']
-    target_bucket = event['target_bucket']
-    target_path = event['target_path']
-    kms_key_id = event['kms_key_id']
-
-    logger.info(f'remote_server: {ast_server}')
-    logger.info(f'secret_manager: {secret_manager}')
-    logger.info(f'ast_port: {ast_port}')
-    logger.info(f'user_ast: {ast_user}')
-    logger.info(f'remote_path: {remote_path}')
-    logger.info(f'target_bucket: {target_bucket}')
-    logger.info(f'target_path: {target_path}')
-    logger.info(f'kms_key_id: {kms_key_id}')
-
-    try:
-        logger.info('Iniciando SSHClient')
-        client = paramiko.SSHClient()
-        logger.info('SSHClient Iniciado')
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        logger.info('Iniciando client S3')
-        s3_client = boto3.client('s3')
-        logger.info('client S3 iniciado')
-
-        logger.info('Iniciando client KMS')
-        kms_client = boto3.client('kms')
-        logger.info('client KMS iniciado')
-
-        logger.info(f'Tentando conexão com AST na porta {ast_port}')
-
-        n = 0
-        while n < 10:
-            try:
-                client.connect(ast_server, ast_port, ast_user, get_secret(secret_manager))
-                n = 10
-            except Exception as e:
-                logger.info(f'Erro conexão AST {n} vez(es) {e}')
-                n += 1
-                if n == 10:
-                    logger.info('Erro conexão AST')
-                    raise ValueError("Erro na Conexão")
-
-        logger.info(f'Conectado com sucesso em {ast_server}:{ast_port}')
-
-        logger.info('Tentando abrir AST')
-        logger.info('client AST modificado para usar o max packet size do servidor de destino: 32000')
-        transport = client.get_transport()
-
-        with paramiko.SFTPClient.from_transport(transport) as sftp:
-            logger.info(f'Listando arquivos no diretório {remote_path}')
-            sftp.chdir(remote_path)
-            files = sftp.listdir()
-            
-            for remote_filename in files:
-                logger.info(f'Downloading file {remote_filename} from sftp to S3')
-                remote_filename_clear = remover_caracteres(remote_filename)
-
-                with io.BytesIO() as data:
-                    sftp.getfo(remote_filename_clear, data)
-                    data.seek(0)
-                    header = data.read(100).decode('utf-8')  # Supondo que o header está nos primeiros 100 bytes
-                    data.seek(0)
-                    
-                    if "Bradesco" in remote_filename_clear:
-                        bank_type = "Bradesco"
-                    elif "BancoDoBrasil" in remote_filename_clear:
-                        bank_type = "Banco do Brasil"
-                    else:
-                        logger.error(f'Arquivo {remote_filename_clear} não identificado como Bradesco ou Banco do Brasil')
-                        continue
-
-                    is_valid, cnpj_part = validate_file(header, bank_type)
-
-                    encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
-                    encrypted_data_io = io.BytesIO(encrypted_data)
-
-                    if not is_valid:
-                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{remote_filename_clear}"
-                        s3_client.upload_fileobj(encrypted_data_io, target_bucket, error_path)
-                        logger.error(f'Arquivo {remote_filename_clear} inválido. Salvando em {error_path}')
-                        continue
-
-                    success_path = f"{target_path}{bank_type}/{cnpj_part}/{datetime.now().strftime('%Y/%m/%d')}/{remote_filename_clear}"
-                    s3_client.upload_fileobj(encrypted_data_io, target_bucket, success_path)
-                    logger.info(f'Arquivo {remote_filename_clear} criptografado e salvo em {success_path}')
-
-        logger.info('fechando conexão SFTP')
-        sftp.close()
-        logger.info('Desligando client SSH')
-        client.close()
-
-        logger.info("Função executada com sucesso.")
-        return {
-            'statusCode': 200,
-            'EnviadosComSucesso': files
-        }
-
-    except Exception as e:
-        erro = str(e)
-        logger.error(f'Erro na execucao: {erro}')
-        raise
-
-***********TESTES++++++++++++++
-
 import pytest
 from botocore.exceptions import ClientError
 import paramiko
 import boto3
 from unittest.mock import patch, Mock, MagicMock
+import io
 
-from src.ast_path_to_s3 import lambda_handler, get_secret, StreamToLogger
+from src.score_360_flow_to_s3 import lambda_handler, get_secret, StreamToLogger, remover_caracteres, encrypt_data, validate_file
 
 
 def test_get_secret():
@@ -206,57 +15,64 @@ def test_get_secret():
         assert secret == 'secret'
 
 
-class StreamToLogger(object):
-
-    def __init__(self, logger, level):
-        self.logger = logger
-        self.level = level
-
-    def write(self, message):
-        if message.rstrip() != "":
-            self.logger.log(self.level, message.rstrip())
-
-    def flush(self):
-        for handler in self.logger.handlers:
-            handler.flush()
-
 def test_stream_to_logger():
     handler = MagicMock()
     logger = Mock()
-    logger.handlers = [handler]  # Adicione esta linha
+    logger.handlers = [handler]
     stream_to_logger = StreamToLogger(logger, 'level')
     stream_to_logger.write('message')
     logger.log.assert_called_with('level', 'message')
     stream_to_logger.flush()
-    handler.flush.assert_called_once()  # Verifique se o flush foi chamado no manipulador
+    handler.flush.assert_called_once()
 
 
-class TestMyModule:
+def test_remover_caracteres():
+    assert remover_caracteres("abc!@#123") == "abc123"
+    assert remover_caracteres("file_name.txt") == "filename.txt"
+
+
+def test_encrypt_data():
+    kms_client = Mock()
+    kms_client.encrypt.return_value = {'CiphertextBlob': b'encrypted_data'}
+    encrypted_data = encrypt_data(kms_client, 'key_id', b'data')
+    assert encrypted_data == b'encrypted_data'
+
+
+def test_validate_file():
+    header_bradesco = '0' * 16 + '0' + '123456789012345'
+    header_bb = '0' * 14 + '12345678901234'
+
+    is_valid, cnpj_part = validate_file(header_bradesco, 'Bradesco')
+    assert is_valid and cnpj_part == '0123456789012345'
+
+    is_valid, cnpj_part = validate_file(header_bb, 'Banco do Brasil')
+    assert is_valid and cnpj_part == '12345678'
+
+
+class TestScore360FlowToS3:
     def setup_method(self, method):
         self.event = {
-            's3_bucket': 'bucket',
-            's3_path': 'path',
             'ast_server': 'server',
-            'ast_port': 'port',
-            'ast_path': 'path',
             'ast_user': 'user',
+            'ast_port': 'port',
             'secret_manager': 'manager',
             'remote_path': 'remote_path',
-            'remote_filename': 'remote_filename',
             'target_bucket': 'target_bucket',
-            'target_path': 'target_path'
+            'target_path': 'target_path',
+            'kms_key_id': 'kms_key_id'
         }
         self.context = {}
 
-    def test_lambda_handler_ats_path_to_s3_sucess(self):
+    def test_lambda_handler_success(self):
         with patch('boto3.client') as mock_boto_client, \
                 patch('paramiko.SSHClient') as mock_ssh_client, \
                 patch('paramiko.SFTPClient.from_transport') as mock_sftp_client, \
-                patch('src.ast_path_to_s3.get_secret') as mock_get_secret: 
+                patch('src.score_360_flow_to_s3.get_secret') as mock_get_secret:
 
             mock_s3 = Mock()
+            mock_kms = Mock()
             mock_secrets = Mock()
-            mock_boto_client.side_effect = [mock_secrets, mock_s3]
+            mock_boto_client.side_effect = [mock_secrets, mock_s3, mock_kms]
 
             mock_secrets.get_secret_value.return_value = {'SecretString': 'secret'}
 
@@ -265,27 +81,27 @@ class TestMyModule:
 
             mock_sftp = Mock()
             mock_sftp.__enter__ = Mock(return_value=mock_sftp)
-            mock_sftp.__exit__ = Mock()  
+            mock_sftp.__exit__ = Mock()
+            mock_sftp.listdir.return_value = ['file1', 'file2']
             mock_sftp_client.return_value = mock_sftp
 
             mock_get_secret.return_value = 'secret'
 
-            # Call the function
             result = lambda_handler(self.event, self.context)
 
-            # Asserts
             assert 'statusCode' in result
             assert result['statusCode'] == 200
 
-    def test_lambda_handler_ats_path_to_s3_authentication_failure(self):
+    def test_lambda_handler_authentication_failure(self):
         with patch('boto3.client') as mock_boto_client, \
                 patch('paramiko.SSHClient') as mock_ssh_client, \
                 patch('paramiko.SFTPClient.from_transport') as mock_sftp_client, \
-                patch('src.ast_path_to_s3.get_secret') as mock_get_secret:
+                patch('src.score_360_flow_to_s3.get_secret') as mock_get_secret:
 
             mock_s3 = Mock()
+            mock_kms = Mock()
             mock_secrets = Mock()
-            mock_boto_client.side_effect = [mock_secrets, mock_s3]
+            mock_boto_client.side_effect = [mock_secrets, mock_s3, mock_kms]
 
             mock_secrets.get_secret_value.side_effect = 'secret'
 
@@ -300,7 +116,7 @@ class TestMyModule:
 
             mock_get_secret.return_value = 'secret'
 
-            with pytest.raises(Exception) as e:
+            with pytest.raises(ValueError) as e:
                 lambda_handler(self.event, self.context)
 
             assert str(e.value) == "Erro na Conexão"

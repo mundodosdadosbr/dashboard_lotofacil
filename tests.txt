@@ -1,12 +1,138 @@
-Arquivo de sucesso do Bradesco: Header deve conter 53 colunas - Posição inicial 17 (sendo um dígito Zero) e da posição 18 a 31 o CNPJ (com 14 dígitos); 
-Arquivo de sucesso do Banco do Brasil: Header deve conter 36 posições - Iniciando o CNPJ na posição 15 à 28 - Porém para salvar o nome na pasta do s3 ele somente utilizará os numeros das posições 15 á 22
+import boto3
+import io
+import paramiko
+import logging
+from datetime import datetime
 
-Para arquivos de sucesso: 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-Banco do Brasil: deverá gravar uma pasta contendo 8 dígitos do CNPJ iniciando na posição 15 ate a 22  
-Bradesco: deverá gravar uma pasta contendo 15 dígitos do CNPJ iniciando na posição 17 até a 31 sendo ( digito 0 + cnpj)
--  Caso ocorra mais de um processamento para o mesmo CNPJ - Existirá uma pasta (de acordo com as informações acima) e dentro desta pasta os processamentos são armazenados por ano/mês/dia - nome do arquivo (criptografado)
+def get_secret(secret_name):
+    client = boto3.client('secretsmanager')
+    response = client.get_secret_value(SecretId=secret_name)
+    secret = response['SecretString']
+    return secret
 
-Para arquivos de erro: deverá ser gravado dentro da pasta erro o arquivo que não foi possível fazer a criptografia devido a algum erro encontrado
+def encrypt_data(kms_client, key_id, data):
+    response = kms_client.encrypt(
+        KeyId=key_id,
+        Plaintext=data
+    )
+    return response['CiphertextBlob']
 
- - Os processamentos são armazenados por ano/mês/dia - nome do arquivo
+def validate_file(header, bank_type):
+    if bank_type == "Bradesco":
+        if len(header) >= 31 and header[16] == '0' and header[17:31].isdigit():
+            return True, '0' + header[17:31]
+    elif bank_type == "Banco do Brasil":
+        if len(header) >= 28 and header[14:28].isdigit():
+            return True, header[14:22]
+    return False, None
+
+def lambda_handler(event, context):
+    logger.info('Receber as variáveis do Airflow')
+    logger.info(event)
+    ast_server = event['ast_server']
+    ast_user = event['ast_user']
+    ast_port = event['ast_port']
+    secret_manager = event['secret_manager']
+    remote_path = event['remote_path']
+    target_bucket = event['target_bucket']
+    target_path = event['target_path']
+    kms_key_id = event['kms_key_id']
+
+    logger.info(f'remote_server: {ast_server}')
+    logger.info(f'secret_manager: {secret_manager}')
+    logger.info(f'ast_port: {ast_port}')
+    logger.info(f'user_ast: {ast_user}')
+    logger.info(f'remote_path: {remote_path}')
+    logger.info(f'target_bucket: {target_bucket}')
+    logger.info(f'target_path: {target_path}')
+    logger.info(f'kms_key_id: {kms_key_id}')
+
+    try:
+        logger.info('Iniciando SSHClient')
+        client = paramiko.SSHClient()
+        logger.info('SSHClient Iniciado')
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        logger.info('Iniciando client S3')
+        s3_client = boto3.client('s3')
+        logger.info('client S3 iniciado')
+
+        logger.info('Iniciando client KMS')
+        kms_client = boto3.client('kms')
+        logger.info('client KMS iniciado')
+
+        logger.info(f'Tentando conexão com AST na porta {ast_port}')
+
+        n = 0
+        while n < 10:
+            try:
+                client.connect(ast_server, ast_port, ast_user, get_secret(secret_manager))
+                n = 10
+            except Exception as e:
+                logger.info(f'Erro conexão AST {n} vez(es) {e}')
+                n += 1
+                if n == 10:
+                    logger.info('Erro conexão AST')
+                    raise ValueError("Erro na Conexão")
+
+        logger.info(f'Conectado com sucesso em {ast_server}:{ast_port}')
+
+        logger.info('Tentando abrir AST')
+        logger.info('client AST modificado para usar o max packet size do servidor de destino: 32000')
+        transport = client.get_transport()
+
+        with paramiko.SFTPClient.from_transport(transport) as sftp:
+            logger.info(f'Listando arquivos no diretório {remote_path}')
+            sftp.chdir(remote_path)
+            files = sftp.listdir()
+            
+            for remote_filename in files:
+                logger.info(f'Downloading file {remote_filename} from sftp to S3')
+
+                with io.BytesIO() as data:
+                    sftp.getfo(remote_filename, data)
+                    data.seek(0)
+                    header = data.read(100).decode('utf-8')  # Supondo que o header está nos primeiros 100 bytes
+                    data.seek(0)
+                    
+                    if "Bradesco" in remote_filename:
+                        bank_type = "Bradesco"
+                    elif "BancoDoBrasil" in remote_filename:
+                        bank_type = "Banco do Brasil"
+                    else:
+                        logger.error(f'Arquivo {remote_filename} não identificado como Bradesco ou Banco do Brasil')
+                        continue
+
+                    is_valid, cnpj_part = validate_file(header, bank_type)
+
+                    encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
+                    encrypted_data_io = io.BytesIO(encrypted_data)
+
+                    if not is_valid:
+                        error_path = f"{target_path}erro/{datetime.now().strftime('%Y/%m/%d')}/{remote_filename}"
+                        s3_client.upload_fileobj(encrypted_data_io, target_bucket, error_path)
+                        logger.error(f'Arquivo {remote_filename} inválido. Salvando em {error_path}')
+                        continue
+
+                    success_path = f"{target_path}{bank_type}/{cnpj_part}/{datetime.now().strftime('%Y/%m/%d')}/{remote_filename}"
+                    s3_client.upload_fileobj(encrypted_data_io, target_bucket, success_path)
+                    logger.info(f'Arquivo {remote_filename} criptografado e salvo em {success_path}')
+
+        logger.info('fechando conexão SFTP')
+        sftp.close()
+        logger.info('Desligando client SSH')
+        client.close()
+
+        logger.info("Função executada com sucesso.")
+        return {
+            'statusCode': 200,
+            'EnviadosComSucesso': files
+        }
+
+    except Exception as e:
+        erro = str(e)
+        logger.error(f'Erro na execucao: {erro}')
+        raise

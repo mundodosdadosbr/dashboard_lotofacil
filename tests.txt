@@ -1,9 +1,8 @@
-                    try:
-                        header = data.read(100).decode('utf-8')
-                        data.seek(0)
-                    except UnicodeDecodeError:
-                        logger.error(f'Erro ao decodificar o arquivo {remote_filename}, movendo para error/')
-                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}"
-                        data.seek(0)
-                        s3_client.upload_fileobj(data, target_bucket, error_path)
-                        continue
+0PASSAGEM00010000213382590001431415253019110012023152
+1F123456789    0920122022235245OO0000000010000000000100 NHSPN                                                                                                 
+1J08765432100019815122022222311OO0000000010000000000100 NHPJ1                                                                                                 
+9000000002                
+
+
+0PASSAGEM000010039446000588723152530
+1F123456789    0920122022235245OO0000000010000000000100 NHSPN    

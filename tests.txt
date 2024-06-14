@@ -1,4 +1,78 @@
-Essa função não seria assim?
+import paramiko
+import logging
+import sys
+import boto3
+import io
+import unicodedata
+from datetime import datetime
+from botocore.exceptions import ClientError
+from boto3.s3.transfer import TransferConfig
+
+GB = 1024 ** 3
+config = TransferConfig(multipart_threshold=1*GB)
+
+logger = logging.getLogger("AST Path score_360 to S3")
+logger.setLevel(logging.DEBUG)
+
+paramiko_logger = logging.getLogger("paramiko")
+paramiko_logger.setLevel(logging.DEBUG)
+paramiko_logger.addHandler(logging.StreamHandler())
+
+
+class StreamToLogger(object):
+
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+
+    def write(self, message):
+        if message.rstrip() != "":
+            self.logger.log(self.level, message.rstrip())
+
+    def flush(self):
+        for handler in self.logger.handlers:
+            handler.flush()
+
+
+stdout_logger = logging.getLogger("STDOUT")
+stderr_logger = logging.getLogger("STDERR")
+
+sys.stdout = StreamToLogger(stdout_logger, logging.DEBUG)
+sys.stderr = StreamToLogger(stderr_logger, logging.DEBUG)
+
+
+def get_secret(secret_name):
+    region_name = "sa-east-1"
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+    except ClientError as e:
+        logging.exception("Error AWS secret")
+        raise e
+
+    secret = get_secret_value_response['SecretString']
+    return secret
+
+def encrypt_data(kms_client, key_id, data):
+    response = kms_client.encrypt(
+        KeyId=key_id,
+        Plaintext=data
+    )
+    return response['CiphertextBlob']
+
+def sanitize_file_name(file_name):
+    nfkd_form = unicodedata.normalize('NFKD', file_name)
+    file_name = ''.join([c for c in nfkd_form if not unicodedata.combining(c)])
+    file_name = file_name.replace('ç', 'c')
+    file_name = file_name.replace(' ', '_')
+    return file_name
 
 def validate_file(filename, header, bank_type):
     logger.info(f"Validating file {filename} for bank type {bank_type}")
@@ -27,7 +101,7 @@ def validate_file(filename, header, bank_type):
             logger.error(f'Invalid header at position 17 for Bradesco: {header[17]}')
             return False, None
         if not header[18:31].isdigit():
-            logger.error(f'Invalid digits in header for Bradesco: {header[17:31]}')
+            logger.error(f'Invalid digits in header for Bradesco: {header[18:31]}')
             return False, None
         cnpj_part = '0' + header[18:31]
     elif bank_type == "Banco do Brasil":
@@ -44,3 +118,130 @@ def validate_file(filename, header, bank_type):
 
     logger.info(f'File {filename} validated successfully for bank type {bank_type}')
     return True, cnpj_part
+
+def lambda_handler(event, context):
+    logger.info('Receber as variáveis do Airflow')
+    logger.info(event)
+    ast_server = event['ast_server']
+    ast_user = event['ast_user']
+    ast_port = event['ast_port']
+    secret_manager = event['secret_manager']
+    remote_path = event['remote_path']
+    target_bucket = event['target_bucket']
+    target_path = event['target_path']
+    kms_key_id = event['kms_key_id']
+
+    logger.info(f'remote_server: {ast_server}')
+    logger.info(f'secret_manager: {secret_manager}')
+    logger.info(f'ast_port: {ast_port}')
+    logger.info(f'user_ast: {ast_user}')
+    logger.info(f'remote_path: {remote_path}')
+    logger.info(f'target_bucket: {target_bucket}')
+    logger.info(f'target_path: {target_path}')
+    logger.info(f'kms_key_id: {kms_key_id}')
+
+    try:
+        logger.info('Iniciando SSHClient')
+        client = paramiko.SSHClient()
+        logger.info('SSHClient Iniciado')
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        logger.info('Iniciando client S3')
+        s3_client = boto3.client('s3')
+        logger.info('client S3 iniciado')
+
+        logger.info('Iniciando client KMS')
+        kms_client = boto3.client('kms')
+        logger.info('client KMS iniciado')
+
+        logger.info(f'Tentando conexão com AST na porta {ast_port}')
+
+        n = 0
+        while n < 10:
+            try:
+                client.connect(ast_server, ast_port, ast_user, get_secret(secret_manager))
+                n = 10
+            except Exception as e:
+                logger.info(f'Erro conexão AST {n} vez(es) {e}')
+                n += 1
+                if n == 10:
+                    logger.info('Erro conexão AST')
+                    raise ValueError("Erro na Conexão")
+
+        logger.info(f'Conectado com sucesso em {ast_server}:{ast_port}')
+
+        logger.info('Tentando abrir AST')
+        logger.info('client AST modificado para usar o max packet size do servidor de destino: 32000')
+        transport = client.get_transport()
+
+        with paramiko.SFTPClient.from_transport(transport) as sftp:
+            logger.info(f'Listando arquivos no diretório {remote_path}')
+            sftp.chdir(remote_path)
+            files = sftp.listdir()
+            
+            for remote_filename in files:
+                sanitized_file_name = sanitize_file_name(remote_filename)
+                logger.info(f'Downloading file {remote_filename} from sftp to S3')
+
+                with io.BytesIO() as data:
+                    sftp.getfo(remote_filename, data)
+                    data.seek(0)
+
+                    if "Bradesco" in remote_filename:
+                        bank_type = "Bradesco"
+                    elif "BancoDoBrasil" in remote_filename:
+                        bank_type = "Banco do Brasil"
+                    else:
+                        logger.error(f'Arquivo {remote_filename} não identificado como Bradesco ou Banco do Brasil')
+                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}"
+                        s3_client.upload_fileobj(data, target_bucket, error_path)
+                        continue
+
+                    try:
+                        header = data.readline().decode('utf-8').strip()  # Lê até a quebra de linha e remove espaços em branco nas extremidades
+                        data.seek(0)
+                    except UnicodeDecodeError:
+                        logger.error(f'Erro ao decodificar o arquivo {remote_filename}, movendo para error/')
+                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}"
+                        s3_client.upload_fileobj(data, target_bucket, error_path)
+                        continue
+
+                    if not header:
+                        logger.error(f'Header vazio para o arquivo {remote_filename}')
+                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}.encrypted"
+                        encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
+                        s3_client.upload_fileobj(io.BytesIO(encrypted_data), target_bucket, error_path)
+                        continue
+
+                    is_valid, cnpj_part = validate_file(sanitized_file_name, header, bank_type)
+
+                    if not is_valid:
+                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}.encrypted"
+                        encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
+                        s3_client.upload_fileobj(io.BytesIO(encrypted_data), target_bucket, error_path)
+                        logger.error(f'Arquivo {sanitized_file_name} inválido. Salvando em {error_path}')
+                        continue
+
+                    # Salva o arquivo criptografado na pasta de sucesso
+                    data.seek(0)
+                    encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
+                    encrypted_data_io = io.BytesIO(encrypted_data)
+                    success_path = f"{target_path}/{cnpj_part}/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}.encrypted"
+                    s3_client.upload_fileobj(encrypted_data_io, target_bucket, success_path)
+                    logger.info(f'Arquivo {sanitized_file_name} criptografado e salvo em {success_path}')
+
+        logger.info('Fechando conexão SFTP')
+        sftp.close()
+        logger.info('Desligando client SSH')
+        client.close()
+
+        logger.info("Função executada com sucesso.")
+        return {
+            'statusCode': 200,
+            'body': 'Arquivos processados com sucesso.'
+        }
+
+    except Exception as e:
+        erro = str(e)
+        logger.error(f'Erro na execucao: {erro}')
+        raise

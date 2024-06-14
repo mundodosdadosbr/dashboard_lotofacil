@@ -3,7 +3,6 @@ import logging
 import sys
 import boto3
 import io
-import re
 import unicodedata
 from datetime import datetime
 from botocore.exceptions import ClientError
@@ -69,12 +68,12 @@ def encrypt_data(kms_client, key_id, data):
     )
     return response['CiphertextBlob']
 
-def sanatize_file_name(file_name):
+def sanitize_file_name(file_name):
     nfkd_form = unicodedata.normalize('NFKD', file_name)
     file_name = ''.join([c for c in nfkd_form if not unicodedata.combining(c)])
-
     file_name = file_name.replace('ç', 'c')
     file_name = file_name.replace(' ', '_')
+    return file_name
 
 def validate_file(filename, header, bank_type):
     # Verificar se filename é uma string
@@ -171,7 +170,7 @@ def lambda_handler(event, context):
             files = sftp.listdir()
             
             for remote_filename in files:
-                sanatized_file_name = sanatize_file_name(remote_filename)
+                sanitized_file_name = sanitize_file_name(remote_filename)
                 logger.info(f'Downloading file {remote_filename} from sftp to S3')
 
                 with io.BytesIO() as data:
@@ -182,8 +181,9 @@ def lambda_handler(event, context):
 
                     if not header:
                         logger.error(f'Header vazio para o arquivo {remote_filename}')
-                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanatized_file_name}.encrypted"
-                        s3_client.upload_fileobj(io.BytesIO(data.read()), target_bucket, error_path)
+                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}.encrypted"
+                        encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
+                        s3_client.upload_fileobj(io.BytesIO(encrypted_data), target_bucket, error_path)
                         continue
 
                     
@@ -195,22 +195,22 @@ def lambda_handler(event, context):
                         logger.error(f'Arquivo {remote_filename} não identificado como Bradesco ou Banco do Brasil')
                         continue
 
-                    is_valid, cnpj_part = validate_file(header, bank_type, sanatized_file_name)
+                    is_valid, cnpj_part = validate_file(sanitized_file_name, header, bank_type)
 
                     if not is_valid:
-                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanatized_file_name}.encrypted"
+                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}.encrypted"
                         encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
                         s3_client.upload_fileobj(io.BytesIO(encrypted_data), target_bucket, error_path)
-                        logger.error(f'Arquivo {sanatized_file_name} inválido. Salvando em {error_path}')
+                        logger.error(f'Arquivo {sanitized_file_name} inválido. Salvando em {error_path}')
                         continue
 
                     encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
                     encrypted_data_io = io.BytesIO(encrypted_data)
 
 
-                    success_path = f"{target_path}/{cnpj_part}/{datetime.now().strftime('%Y/%m/%d')}/{sanatized_file_name}.encrypted"
+                    success_path = f"{target_path}/{cnpj_part}/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}.encrypted"
                     s3_client.upload_fileobj(encrypted_data_io, target_bucket, success_path)
-                    logger.info(f'Arquivo {sanatized_file_name} criptografado e salvo em {success_path}')
+                    logger.info(f'Arquivo {sanitized_file_name} criptografado e salvo em {success_path}')
 
         logger.info('Fechando conexão SFTP')
         sftp.close()

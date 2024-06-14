@@ -1,39 +1,80 @@
-import boto3
-import io
 import paramiko
 import logging
+import sys
+import boto3
+import io
 import re
 import unicodedata
 from datetime import datetime
+from botocore.exceptions import ClientError
+from boto3.s3.transfer import TransferConfig
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+GB = 1024 ** 3
+config = TransferConfig(multipart_threshold=1*GB)
+
+logger = logging.getLogger("AST Path score_360 to S3")
+logger.setLevel(logging.DEBUG)
+
+paramiko_logger = logging.getLogger("paramiko")
+paramiko_logger.setLevel(logging.DEBUG)
+paramiko_logger.addHandler(logging.StreamHandler())
+
+
+class StreamToLogger(object):
+
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+
+    def write(self, message):
+        if message.rstrip() != "":
+            self.logger.log(self.level, message.rstrip())
+
+    def flush(self):
+        for handler in self.logger.handlers:
+            handler.flush()
+
+
+stdout_logger = logging.getLogger("STDOUT")
+stderr_logger = logging.getLogger("STDERR")
+
+sys.stdout = StreamToLogger(stdout_logger, logging.DEBUG)
+sys.stderr = StreamToLogger(stderr_logger, logging.DEBUG)
+
 
 def get_secret(secret_name):
-    client = boto3.client('secretsmanager')
-    response = client.get_secret_value(SecretId=secret_name)
-    secret = response['SecretString']
+
+    region_name = "sa-east-1"
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+    except ClientError as e:
+        logging.exception("Error AWS secret")
+        raise e
+
+    secret = get_secret_value_response['SecretString']
     return secret
 
 def encrypt_data(kms_client, key_id, data):
-    response = kms_client.encrypt(
-        KeyId=key_id,
-        Plaintext=data
+    response =  kms_client.encrypt(
+        KeyId = key_id,
+        Plaintext = data
     )
     return response['CiphertextBlob']
 
-def sanitize_filename(filename):
-    # Remover acentos
-    nfkd_form = unicodedata.normalize('NFKD', filename)
-    filename = ''.join([c for c in nfkd_form if not unicodedata.combining(c)])
-    
-    # Substituir 'ç' por 'c'
-    filename = filename.replace('ç', 'c').replace('Ç', 'C')
-    
-    # Substituir espaços por '-'
-    filename = filename.replace(' ', '-')
-    
-    return filename
+def sanatize_file_name(file_name):
+    nfkd_form = unicodedata.normalize('NFKD', file_name)
+    file_name = ''.join([c for c in nfkd_form if not unicodedata.combining(c)])
+
+    file_name = file_name.replace('ç', 'c')
+    file_name = file_name.replace(' ', '_')
 
 def validate_file(filename, header, bank_type):
     # Verificar se filename é uma string
@@ -46,11 +87,6 @@ def validate_file(filename, header, bank_type):
         logger.error(f'Filename does not end with .txt: {filename}')
         return False, None
     
-    # Verificar se o nome do arquivo contém caracteres especiais permitidos
-    if not re.match(r'^[a-zA-Z0-9_.-]+$', filename):
-        logger.error(f'Filename contains invalid characters: {filename}')
-        return False, None
-    
     # Verificar se o header está em branco
     if not header.strip():
         logger.error(f'Header is empty for filename: {filename}')
@@ -61,17 +97,18 @@ def validate_file(filename, header, bank_type):
         if len(header) != 53 or header[16] != '0' or not header[17:31].isdigit():
             logger.error(f'Invalid header for Bradesco: {header}')
             return False, None
-        cnpj_part = '0' + header[17:31]  # Posição inicial 17 (com 0) + 14 dígitos (posição 18 a 31)
+        cnpj_part = '0' + header[17:31]  
     elif bank_type == "Banco do Brasil":
         if len(header) != 36 or not header[14:28].isdigit():
             logger.error(f'Invalid header for Banco do Brasil: {header}')
             return False, None
-        cnpj_part = header[14:22]  # Posições 15 a 22 (índice 14 a 21)
+        cnpj_part = header[14:22]
     else:
         logger.error(f'Unknown bank type: {bank_type}')
         return False, None
 
     return True, cnpj_part
+
 
 def lambda_handler(event, context):
     logger.info('Receber as variáveis do Airflow')
@@ -134,25 +171,22 @@ def lambda_handler(event, context):
             files = sftp.listdir()
             
             for remote_filename in files:
-                if remote_filename is None:
-                    logger.error('Filename is None')
-                    continue
-                
-                sanitized_filename = sanitize_filename(remote_filename)
-                logger.info(f'Downloading file {remote_filename} from sftp to S3 as {sanitized_filename}')
+                sanatized_file_name = sanatize_file_name(remote_filename)
+                logger.info(f'Downloading file {remote_filename} from sftp to S3')
 
                 with io.BytesIO() as data:
                     sftp.getfo(remote_filename, data)
                     data.seek(0)
-                    header = data.read(100).decode('utf-8').strip()  # Supondo que o header está nos primeiros 100 bytes
+                    header = data.read(100).decode('utf-8')
                     data.seek(0)
-                    
+
                     if not header:
                         logger.error(f'Header vazio para o arquivo {remote_filename}')
-                        error_path = f"{target_path}erro/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_filename}.encrypted"
+                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanatized_file_name}.encrypted"
                         s3_client.upload_fileobj(io.BytesIO(data.read()), target_bucket, error_path)
                         continue
 
+                    
                     if "Bradesco" in remote_filename:
                         bank_type = "Bradesco"
                     elif "BancoDoBrasil" in remote_filename:
@@ -161,23 +195,24 @@ def lambda_handler(event, context):
                         logger.error(f'Arquivo {remote_filename} não identificado como Bradesco ou Banco do Brasil')
                         continue
 
-                    is_valid, cnpj_part = validate_file(sanitized_filename, header, bank_type)
+                    is_valid, cnpj_part = validate_file(header, bank_type, sanatized_file_name)
 
                     if not is_valid:
-                        logger.error(f'Arquivo {remote_filename} inválido. Salvando em erro.')
-                        error_path = f"{target_path}erro/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_filename}.encrypted"
+                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanatized_file_name}.encrypted"
                         encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
                         s3_client.upload_fileobj(io.BytesIO(encrypted_data), target_bucket, error_path)
+                        logger.error(f'Arquivo {sanatized_file_name} inválido. Salvando em {error_path}')
                         continue
 
                     encrypted_data = encrypt_data(kms_client, kms_key_id, data.read())
                     encrypted_data_io = io.BytesIO(encrypted_data)
 
-                    success_path = f"{target_path}{bank_type}/{cnpj_part}/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_filename}.encrypted"
-                    s3_client.upload_fileobj(encrypted_data_io, target_bucket, success_path)
-                    logger.info(f'Arquivo {remote_filename} criptografado e salvo em {success_path}')
 
-        logger.info('fechando conexão SFTP')
+                    success_path = f"{target_path}/{cnpj_part}/{datetime.now().strftime('%Y/%m/%d')}/{sanatized_file_name}.encrypted"
+                    s3_client.upload_fileobj(encrypted_data_io, target_bucket, success_path)
+                    logger.info(f'Arquivo {sanatized_file_name} criptografado e salvo em {success_path}')
+
+        logger.info('Fechando conexão SFTP')
         sftp.close()
         logger.info('Desligando client SSH')
         client.close()

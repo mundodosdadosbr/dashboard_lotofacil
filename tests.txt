@@ -1,6 +1,9 @@
-[ERROR] UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
-Traceback (most recent call last):
-  File "/var/task/src/score_360_flow_to_s3.py", line 178, in lambda_handler
-    header = data.read(100).decode('utf-8')
-
-[ERROR] UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte Traceback (most recent call last):   File "/var/task/src/score_360_flow_to_s3.py", line 178, in lambda_handler     header = data.read(100).decode('utf-8')
+                    try:
+                        header = data.read(100).decode('utf-8')
+                        data.seek(0)
+                    except UnicodeDecodeError:
+                        logger.error(f'Erro ao decodificar o arquivo {remote_filename}, movendo para error/')
+                        error_path = f"{target_path}error/{datetime.now().strftime('%Y/%m/%d')}/{sanitized_file_name}"
+                        data.seek(0)
+                        s3_client.upload_fileobj(data, target_bucket, error_path)
+                        continue

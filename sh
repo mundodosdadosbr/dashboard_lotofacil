@@ -4,29 +4,23 @@ BUCKET_DATAHUB="$3"
 ENV="$4"
 # ------------------------- Optional parameters ------------------------- #
 KNARR_VERSION="${5:-1.0.2}"
-SPARK_MASTER="${6:-"yarn"}"
-SPARK_DEPLOY_MODE="${7:-"cluster"}"
-SPARK_DRIVER_MEMORY="${8:-"6g"}"
-SPARK_EXECUTOR_MEMORY="${9:-"8g"}"
+SPARK_MASTER="${6:-yarn}"
+SPARK_DEPLOY_MODE="${7:-cluster}"
+SPARK_DRIVER_MEMORY="${8:-6g}"
+SPARK_EXECUTOR_MEMORY="${9:-8g}"
 SPARK_NUM_EXECUTORS="${10:-22}"
 SPARK_MIN_EXECUTORS="${11:-22}"
 SPARK_MAX_EXECUTORS="${12:-22}"
-SPARK_CORE_EXECUTORS="${13-1}"
-SPARK_MAX_RESULT_SIZE="${14-"2g"}"
+SPARK_CORE_EXECUTORS="${13:-1}"
+SPARK_MAX_RESULT_SIZE="${14:-2g}"
 ###########################################################################
-
 ############################ Find Date ####################################
-
 DATA_EXECUCAO=$(date +%Y%m%d)
-
 ###########################################################################
-
 emr_id=$(cat /mnt/var/lib/info/job-flow.json | jq -r ".jobFlowId")
-
 echo "====================================================================="
 echo "ENV:" ${ENV}
 echo "EMR_ID:" ${emr_id}
-echo "DATASET=" ${DATASET}
 echo "DATA_PROC=" ${DATA_PROC}
 echo "BUCKET_DATAHUB=" ${BUCKET_DATAHUB}
 echo "KNARR_VERSION=" ${KNARR_VERSION}
@@ -40,21 +34,19 @@ echo "SPARK_MAX_EXECUTORS=" ${SPARK_MAX_EXECUTORS}
 echo "SPARK_CORE_EXECUTORS=" ${SPARK_CORE_EXECUTORS}
 echo "SPARK_MAX_RESULT_SIZE=" ${SPARK_MAX_RESULT_SIZE}
 echo "====================================================================="
-
 ###########################################################################
 # ---------------------------- Composite values ------------------------- #
-
-if [ ${ENV,,} == "dev" ];then
+if [ "${ENV,,}" == "dev" ]; then
     SQS_QUEUE_ERRORS="https://sqs.sa-east-1.amazonaws.com/530914589075/datahub_alert_teams_dev"    
     BUCKET_ODIN="serasaexperian-odin-data-mesh-dev-multiprovider"
     GLUE_CATALOG_ID_ODIN="294463638235"
     USING_LAKE_FORMATION=false    
-elif [ ${ENV,,} == "uat" ];then
+elif [ "${ENV,,}" == "uat" ]; then
     SQS_QUEUE_ERRORS="https://sqs.sa-east-1.amazonaws.com/146737708860/datahub_alert_teams_uat"  
     BUCKET_ODIN="serasaexperian-odin-data-mesh-uat-multiprovider"
     GLUE_CATALOG_ID_ODIN="201085490967"
     USING_LAKE_FORMATION=false        
-elif [ ${ENV,,} == "prod" ];then
+elif [ "${ENV,,}" == "prod" ]; then
     SQS_QUEUE_ERRORS="https://sqs.sa-east-1.amazonaws.com/662860092544/datahub_alert_teams_prod"    
     BUCKET_ODIN="serasaexperian-odin-data-mesh-prod-multiprovider"
     GLUE_CATALOG_ID_ODIN="833589082975"
@@ -263,4 +255,3 @@ if [ $RC -eq 0 ]; then
         RC=$(($RC + $?))
         exit 1    
 fi
-

@@ -1,28 +1,63 @@
 {
     "fields": [
         [
-            "co_referencia_externa"
+            "ap004_ret",
+            "ap005_agenda",
+            "ap005_agenda_erro",
+            "ap004_enviado"
         ]
     ],
     "dataPipeline": [
         {
-            "typeOp": "group_by",
-            "gFields": ["co_referencia_externa"],
-            "aggs": [
-                "count(distinct co_referencia_externa) as registro_contagem"
-            ],
-            "select": [["registro_contagem"]]
+            "typeOp": "select",
+            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP004/entrada/20240730/*",
+            "select": [
+                "total_registro_contagem as ap004_ret"
+            ]
         },
         {
-            "typeOp": "group_by",
-            "gFields": [],
-            "aggs": [
-                "sum(registro_contagem) as total_registro_contagem"
-            ],
-            "select": [["total_registro_contagem"]]
+            "typeOp": "union",
+            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP005/agenda/20240730/*",
+            "select": [
+                "total_registro_contagem as ap005_agenda"
+            ]
+        },
+        {
+            "typeOp": "union",
+            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP005/agenda_erro/20240730/*",
+            "select": [
+                "total_registro_contagem as ap005_agenda_erro"
+            ]
+        },
+        {
+            "typeOp": "union",
+            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP004/saida/20240730/*",
+            "select": [
+                "total_registro_contagem as ap004_enviado"
+            ]
+        },
+        {
+            "typeOp": "with_columns",
+            "select": [
+                "ap004_ret",
+                "ap005_agenda",
+                "ap005_agenda_erro",
+                "ap004_enviado",
+                "(ap004_ret + ap005_agenda + ap005_agenda_erro) as soma_contagens"
+            ]
+        },
+        {
+            "typeOp": "where",
+            "select": [
+                "soma_contagens",
+                "ap004_enviado",
+                "(soma_contagens = ap004_enviado) as sucesso"
+            ]
         }
     ],
-    "lsErros": [],
+    "lsErros": [
+        "case when sucesso = false then 'Erro: The number os records sent ins not equal to those returned' else '' end"
+    ],
     "filters": [],
     "dropColsLayers": [],
     "partitionBy": [],

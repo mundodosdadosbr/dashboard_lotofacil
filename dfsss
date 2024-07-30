@@ -10,29 +10,44 @@
     "dataPipeline": [
         {
             "typeOp": "select",
-            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP004/entrada/20240730/*",
             "select": [
                 "total_registro_contagem as ap004_ret"
-            ]
+            ],
+            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP004/entrada/20240730/*"
         },
         {
             "typeOp": "union",
-            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP005/agenda/20240730/*",
+            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP005/agenda/20240730/*"
+        },
+        {
+            "typeOp": "with_columns",
             "select": [
+                "ap004_ret",
                 "total_registro_contagem as ap005_agenda"
             ]
         },
         {
             "typeOp": "union",
-            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP005/agenda_erro/20240730/*",
+            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP005/agenda_erro/20240730/*"
+        },
+        {
+            "typeOp": "with_columns",
             "select": [
+                "ap004_ret",
+                "ap005_agenda",
                 "total_registro_contagem as ap005_agenda_erro"
             ]
         },
         {
             "typeOp": "union",
-            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP004/saida/20240730/*",
+            "inputPath": "s3://datahub-comportamental-input-dev/projetos/multiprovider/cerc/dados/count/AP004/saida/20240730/*"
+        },
+        {
+            "typeOp": "with_columns",
             "select": [
+                "ap004_ret",
+                "ap005_agenda",
+                "ap005_agenda_erro",
                 "total_registro_contagem as ap004_enviado"
             ]
         },
@@ -48,6 +63,7 @@
         },
         {
             "typeOp": "where",
+            "predicate": "soma_contagens = ap004_enviado",
             "select": [
                 "soma_contagens",
                 "ap004_enviado",
@@ -56,7 +72,7 @@
         }
     ],
     "lsErros": [
-        "case when sucesso = false then 'Erro: The number os records sent ins not equal to those returned' else '' end"
+        "case when sucesso = false then 'Erro: The number os records sent is not equal to those returned' else '' end"
     ],
     "filters": [],
     "dropColsLayers": [],

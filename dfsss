@@ -1,22 +1,51 @@
-[hadoop@ip-10-99-85-124 diego]$ ./start_cerc_validation_0.0.1.sh 0 datahub-comportamental-input-dev dev
-=====================================================================
-ENV:
-EMR_ID: j-391DD2D1L7OHY
-DATA_PROC= datahub-comportamental-input-dev
-BUCKET_DATAHUB= dev
-KNARR_VERSION= 1.0.2
-SPARK_MASTER= yarn
-SPARK_DEPLOY_MODE= cluster
-SPARK_DRIVER_MEMORY= 6g
-SPARK_EXECUTOR_MEMORY= 8g
-SPARK_NUM_EXECUTORS= 22
-SPARK_MIN_EXECUTORS= 22
-SPARK_MAX_EXECUTORS= 22
-SPARK_CORE_EXECUTORS= 1
-SPARK_MAX_RESULT_SIZE= 2g
-=====================================================================
-./start_cerc_validation_0.0.1.sh: line 44: syntax error near unexpected token `elif'
-'/start_cerc_validation_0.0.1.sh: line 44: `elif [ "${ENV,,}" == "uat" ]; then
-[hadoop@ip-10-99-85-124 diego]$
-[hadoop@ip-10-99-85-124 diego]$
-[hadoop@ip-10-99-85-124 diego]$
+{
+    "fields": [
+        [
+            "_c0 as co_referencia_externa",
+            "_c3 as fl_erro"
+        ]
+    ],
+    "dataPipeline": [
+        {
+            "typeOp": "where",
+            "select":[
+                "co_referencia_externa",
+                "fl_erro"
+            ],
+            "filters":[["fl_erro = 1"]]    
+        },
+        {
+            "typeOp": "group_by",
+            "gFields": ["co_referencia_externa", "fl_erro"],
+            "aggs": [
+                "count(distinct co_referencia_externa) as registro_contagem"
+            ],
+            "select": [["registro_contagem"]]
+        },
+        {
+            "typeOp": "group_by",
+            "gFields": ["registro_contagem"],
+            "aggs": [
+                "sum(registro_contagem) as total_registro_contagem"
+            ],
+            "select": [["total_registro_contagem"]]
+        }
+    ],
+    "lsErros": [],
+    "filters": [],
+    "dropColsLayers": [],
+    "partitionBy": [],
+    "inputDataOptions": {
+        "format": "CSV",
+        "encrypted": "false",
+        "optionsRead": {
+            "header": "false",
+            "delimiter": ";"
+        }
+    },
+    "outputFmtData": {
+        "format": "PARQUET",
+        "outputModeParquet": "overwrite",
+        "encrypted": "false"
+    }
+}

@@ -1,22 +1,13 @@
 {
     "fields": [
         [
-            "_c0 as co_referencia_externa",
-            "_c3 as fl_erro"
+            "co_referencia_externa"
         ]
     ],
     "dataPipeline": [
         {
-            "typeOp": "where",
-            "select":[
-                "co_referencia_externa",
-                "fl_erro"
-            ],
-            "filters":[["fl_erro = 1"]]    
-        },
-        {
             "typeOp": "group_by",
-            "gFields": ["co_referencia_externa", "fl_erro"],
+            "gFields": ["co_referencia_externa"],
             "aggs": [
                 "count(distinct co_referencia_externa) as registro_contagem"
             ],
@@ -24,7 +15,7 @@
         },
         {
             "typeOp": "group_by",
-            "gFields": ["registro_contagem"],
+            "gFields": [],
             "aggs": [
                 "sum(registro_contagem) as total_registro_contagem"
             ],
@@ -36,12 +27,9 @@
     "dropColsLayers": [],
     "partitionBy": [],
     "inputDataOptions": {
-        "format": "CSV",
+        "format": "PARQUET",
         "encrypted": "false",
-        "optionsRead": {
-            "header": "false",
-            "delimiter": ";"
-        }
+        "optionsRead": {}
     },
     "outputFmtData": {
         "format": "PARQUET",
